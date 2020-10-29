@@ -6,11 +6,12 @@ use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use rppal::i2c::I2c;
 use rppal::gpio::Gpio;
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Hello, world!");
     let mut handles= Vec::new();
     let data =Arc::new(Mutex::new(vec![1;10]));
-
+    let mut a = add(3,5).await;
     for x in 0..10{
         let data_ref= data.clone();
         handles.push(thread::spawn(move || {
@@ -23,6 +24,7 @@ fn main() {
     for handle in handles{
         let _ = handle.join();
     }
+    dbg!(a);
     dbg!(&data);
     let mut gpio = Gpio::new().expect("failed to get gpio!");
     dbg!(&gpio);
