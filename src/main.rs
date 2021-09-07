@@ -1,105 +1,359 @@
 extern crate rppal;
+extern crate serialport;
 
-use rppal::gpio::Gpio;
-use rppal::i2c::I2c;
-use std::sync::{Arc, Mutex};
+mod httprequest;
+mod mqtt;
+mod usb_2jcie;
+
+use core::time::Duration;
+use rumqtt::{mqttoptions, MqttClient, MqttOptions, QoS, ReconnectOptions};
+
+use serialport::SerialPort;
+use std::fs::read;
+use std::io::prelude::*;
+use std::path::Path;
+
 use std::thread;
-use std::time::Duration;
+// use std::time::Duration;
 use tokio;
-
-const ADDR_I2C: u16 = 0x76;
-const REG_CTRL_HUM: u8 = 0xF2;
-const REG_ADC_VALUE: u8 = 0xF7;
-const ACC_I2C_ADDRESS: u16 = 0x19;// BMX055　加速度センサのI2Cアドレス  
-const GYRO_I2C_ADDRESS: u16 = 0x69;// BMX055　ジャイロセンサのI2Cアドレス
-const MAG_I2C_ADDRESS: u16 = 0x13;// BMX055　磁気センサのI2Cアドレス
 
 #[tokio::main]
 async fn main() {
-    println!("Hello, world!");
-    //let p = acquire().map(|data| println!("{}",data)).expect("failed to get i2c");
-    loop {
-        let accz = bmx055_acc().unwrap();
-        dbg!(&accz);
-        let gyro = BMX055_gyro();
-        dbg!(&gyro);
-        let mag= BMX055_Mag();
-        dbg!(&mag);
-        thread::sleep(Duration::from_secs_f32(0.5));
+    /*let ports = serialport::available_ports().expect("No ports found");
+    for p in ports{
+        dbg!(&p);
+    }*/
+    let mut data = usb_2jcie::usb_2jcie::new();
+    let rootCApath = Path::new("../cert/root-CA.crt");
+    let privatekeypath = Path::new("/home/master/rasp/cert/raspidevice.private.key");
+    let certpath = Path::new("/home/master/rasp/cert/raspidevice.cert.pem");
+    let mqttoptions: MqttOptions = MqttOptions::new(
+        "sdk-nodejs-7c641eb5-0c2e-4e2e-9bb5-c8920275ae7c",
+        "a3tzmb0oyi31tk-ats.iot.ap-northeast-1.amazonaws.com",
+        8883,
+    )
+    .set_ca(read(&rootCApath).expect("cannot open rootCA"))
+    .set_client_auth(read(&certpath).unwrap(), read(&privatekeypath).unwrap())
+    .set_keep_alive(10)
+    .set_connection_timeout(5)
+    .set_reconnect_opts(ReconnectOptions::Always(5));
+    let (mut mqttclient, notifications) = MqttClient::start(mqttoptions).expect("connexct error");
+
+    let _r = match mqttclient.subscribe("topic_1", QoS::AtMostOnce) {
+        Ok(_f) => println!("subscribe"),
+        Err(e) => println!("client error = {:?}", e),
+    };
+
+    let mut serial = serialport::new("/dev/ttyUSB0", 115200)
+        .timeout(Duration::from_millis(100))
+        .open()
+        .expect("failed to open port");
+
+    thread::spawn(move || {
+        loop {
+            let res = getlongdata(&mut serial);
+            match res {
+                Ok(longdata) => {
+                    let index = getindex(&longdata).unwrap_or_else(|| 0);
+                    data.parse(&longdata[index..]);
+                    //json文字列を作る
+                    let json = serde_json::to_string(&data).unwrap();
+                    thread::sleep(Duration::from_millis(100));
+                    match mqttclient.publish("topic_1", QoS::AtLeastOnce, false, json.as_str()) {
+                        Ok(_f) => println!("published!"),
+                        Err(e) => println!("client error = {:?}", e),
+                    };
+                }
+                Err(_) => todo!(),
+            }
+            thread::sleep(Duration::from_secs(10));
+        }
+    });
+
+    for notification in notifications {
+        println!("{:?}", notification)
     }
-    let mut gpio = Gpio::new().expect("failed to get gpio!");
-    dbg!(&gpio);
 }
-fn bmx055_acc() -> Result<(i16, i16, i16), rppal::i2c::Error> {
-    let mut i2c = I2c::new()?;
-    i2c.set_slave_address(ACC_I2C_ADDRESS)?;
-    let mut data: Vec<u16> = vec![0; 6];
-    for i in 0..6 {
-        data[i] = i2c.smbus_read_byte((2 + i) as u8)? as u16;
+
+fn show(byte: &Vec<u8>) {
+    for i in byte {
+        print!("0x{:x},", i);
     }
-    let mut acc_x: u16 = ((data[1] * 256) + (data[0] & 0xF0)) / 16;
-    if acc_x > 2047 {
-        acc_x -= 4096;
+    println!();
+}
+
+fn crc16(bytes: &[u8], from_index: usize, to_index: usize) -> (u8, u8) {
+    let mut crc: u16 = 0xFFFF;
+    for i in from_index..to_index {
+        let b = bytes[i] as u16;
+        crc = crc ^ b;
+        for j in 0..8 {
+            let lsb = crc & 1;
+            crc = crc >> 1 & 0x7FFF;
+            if lsb == 1 {
+                crc = crc ^ 0xA001;
+            }
+        }
     }
-    let mut acc_y: u16 = ((data[3] * 256) + (data[2] & 0xF0)) / 16;
-    if acc_y > 2047 {
-        acc_y -= 4096;
+    let crc_l = (crc & 0x00FF) as u8;
+    let crc_h = (crc >> 8) as u8;
+    return (crc_l, crc_h);
+}
+
+fn getlongdata(ser: &mut Box<dyn SerialPort>) -> Result<Vec<u8>, serialport::Error> {
+    let mut command = vec![
+        0x52u8, 0x42, 0x0a, 0x00, 0x02, 0x11, 0x51, 0x01, 0x00, 255, 255, 0,
+    ]; // LED ON
+    let (crc_l, crc_h) = crc16(&command, 0, command.len());
+    command.push(crc_l);
+    command.push(crc_h);
+
+    let mut command2 = vec![0x52u8, 0x42, 0x05, 0x00, 0x01, 0x21, 0x50]; //get latest data long
+    let (crc_l, crc_h) = crc16(&command2, 0, command2.len());
+    command2.push(crc_l);
+    command2.push(crc_h);
+
+    ser.write_all(&command).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    ser.write_all(&command2)?; //send for getting latest data long
+    thread::sleep(Duration::from_millis(100));
+    let mut res: Vec<u8> = vec![0; 90];
+    ser.read(res.as_mut())?;
+
+    show(&res);
+    Ok(res)
+}
+
+//usbからLongdataが取得できているかどうかを探る イテレータの関数でなんとかできないか
+fn getindex(longdata: &Vec<u8>) -> Option<usize> {
+    let checking = [0x52u8, 0x42, 0x36, 0x0, 0x1, 0x21, 0x50];
+    for (i, num) in longdata.iter().enumerate() {
+        for j in checking.iter().enumerate() {
+            if longdata[i + j.0] == checking[j.0] {
+                println!("{:x}", j.1);
+            } else {
+                break;
+            }
+
+            if j.0 == checking.len() - 1 {
+                return Some(i);
+            }
+        }
     }
-    let mut acc_z: u16 = ((data[5] * 256) + (data[4] & 0xF0)) / 16;
-    if acc_z > 2047 {
-        acc_z -= 4096;
+    None
+}
+#[cfg(test)]
+mod tests {
+    use std::vec;
+
+    use futures::executor::BlockingStream;
+    use serde::Serialize;
+
+    use super::*;
+
+    #[test]
+    fn test_crc16() {
+        let mut command = vec![0x52, 0x42, 0x05, 0x00, 0x01, 0x21, 0x50];
+        let (crc1, crc2) = crc16(&command, 0, command.len());
+        println!("crc16 = 0x{:x}, 0x{:x}", crc1, crc2);
+    }
+    fn read_i16(high: u8, low: u8) -> u16 {
+        let higher: u16 = (high as u16) << 8;
+        let value: u16 = higher + low as u16;
+        value
+    }
+    #[test]
+    fn tests16() {
+        let header2 = vec![0x52u16, 0x42, 0x05, 0x03, 0x55];
+        let a = read_i16(0x51, 0x7b);
+        println!("0x{:}", a as f64 / 100.0);
     }
 
-    Ok((acc_x as i16, acc_y as i16, acc_z as i16))
-}
+    #[test]
+    fn stru() {
+        let new = vec![
+            0x01, 0x52, 0x42, 0x36, 0x0, 0x1, 0x21, 0x50, 0x6a, 0x1, 0xb, 0x97, 0x15, 0x72, 0x0,
+            0x84, 0x24, 0xf, 0x0, 0xb6, 0x20, 0x17, 0x0, 0x29, 0x2, 0xee, 0x1d, 0xac, 0x9, 0x1,
+            0x14, 0x0, 0x34, 0x3, 0xcc, 0xb, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5c, 0xab, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+        ];
+        let new = vec![
+            0x52u8, 0x42, 0xa, 0x0, 0x2, 0x11, 0x51, 0x1, 0x0, 0xff, 0xff, 0x0, 0xe2, 0x5, 0x52,
+            0x42, 0x36, 0x0, 0x1, 0x21, 0x50, 0x5c, 0x23, 0xc, 0xf4, 0x19, 0xeb, 0x0, 0x60, 0x43,
+            0xf, 0x0, 0xef, 0x11, 0x37, 0x0, 0xfb, 0x2, 0x30, 0x20, 0x58, 0xb, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xe0, 0x1d, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0,
+        ];
 
-fn BMX055_gyro() -> Result<(i16, i16, i16), rppal::i2c::Error> {
-    let mut i2c = I2c::new()?;
-    i2c.set_slave_address(GYRO_I2C_ADDRESS)?;
-    let mut data: Vec<u32> = vec![0; 6];
-    for i in 0..6 {
-        data[i] = i2c.smbus_read_byte((2 + i) as u8)? as u32;
-    }
-    let mut gyro_x: u32 = (data[1] * 256) + data[0];
-    if gyro_x > 32767 {
-        gyro_x -= 65536;
-    }
-    let mut gyro_y: u32 = (data[3] * 256) + data[2];
-    if gyro_x > 32767 {
-        gyro_x -= 65536;
-    }
-    let mut gyro_z: u32 = (data[5] * 256) + data[4];
-    if gyro_x > 32767 {
-        gyro_x -= 65536;
-    }
-    Ok((gyro_x as i16, gyro_y as i16, gyro_z as i16))
-}
-fn BMX055_Mag() -> Result<(i16, i16, i16), rppal::i2c::Error> {
-    let mut i2c = I2c::new()?;
-    i2c.set_slave_address(MAG_I2C_ADDRESS)?;
-    let mut data: Vec<u16> = vec![0; 8];
-    for i in 0..8 {
-        data[i] = i2c.smbus_read_byte((0x42 + i) as u8)? as u16;
+        let pp = vec![
+            0x52u8, 0x42, 0xa, 0x0, 0x2, 0x11, 0x51, 0x1, 0x0, 0xff, 0xff, 0x0, 0xe2, 0x5, 0x52,
+            0x42, 0x36, 0x0, 0x1, 0x21, 0x50, 0xe9, 0x95, 0xb, 0x95, 0x1b, 0xf1, 0x0, 0xb9, 0x48,
+            0xf, 0x0, 0xb6, 0x28, 0x15, 0x0, 0x1e, 0x2, 0x9e, 0x1f, 0x12, 0xb, 0x1, 0xdf, 0x0,
+            0xc4, 0x22, 0xd0, 0x13, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x7f, 0x96, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+        ];
+        // let a = new.iter().scan(1,|initial_state, &f|{
+        //Some()
+        // });
+        //index付きのループ enumerate()
+        //usbからLongdataが取得できているかどうかを探る イテレータの関数でなんとかできないか
+        let index = getindex(&pp).unwrap();
+        let index2 = getindex2(&pp);
+        let lter = pp.iter().enumerate().skip(index);
+
+        dbg!(index);
+        dbg!(index2);
+        let mut sam = usb_2jcie::usb_2jcie::new();
+        sam.parse(&pp[index..]);
+        println!("{:?}", &sam);
     }
 
-    let mut xMag = (data[1] << 8) | (data[0] >> 3);
-    if xMag > 4095 {
-        xMag -= 8192;
+    //usbからLongdataが取得できているかどうかを探る
+    fn getindex(d: &Vec<u8>) -> Option<usize> {
+        let checking = [0x52u8, 0x42, 0x36, 0x0, 0x1, 0x21, 0x50];
+        for (i, num) in d.iter().enumerate() {
+            for j in checking.iter().enumerate() {
+                if d[i + j.0] == checking[j.0] {
+                    println!("{:x}", j.1);
+                } else {
+                    break;
+                }
+
+                //配列checkingが含まれていたらreturn
+                if j.0 == checking.len() - 1 {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
-    let mut yMag = (data[3] << 8) | (data[2] >> 3);
-    if yMag > 4095 {
-        yMag -= 8192;
+
+    fn getindex2(d: &Vec<u8>) -> Option<usize> {
+        let checking = [0x52u8, 0x42, 0x36, 0x0, 0x1, 0x21, 0x50];
+        let a = d.iter().enumerate().map(|(i, &num)| {
+            let b = checking.iter();
+            print!("{:?}", i);
+        });
+        None
     }
-    let mut zMag = (data[5] << 8) | (data[4] >> 3);
-    if zMag > 16383 {
-        zMag -= 32768;
+    #[test]
+    fn mqtt2() {
+        use rumqtt::{mqttoptions, MqttClient, MqttOptions, QoS, ReconnectOptions};
+        use serde::{Deserialize, Serialize};
+        use std::error::Error;
+        use std::fs::{read, File};
+        use std::path::Path;
+        let rootCApath = Path::new("../cert/root-CA.crt");
+        let privatekeypath = Path::new("../cert/raspidevice.private.key");
+        let certpath = Path::new("/home/master/rasp/cert/raspidevice.cert.pem");
+        let mqttoptions = MqttOptions::new(
+            "sdk-nodejs-7c6",
+            "a3tzmb0oyi31tk-ats.iot.ap-northeast-1.amazonaws.com",
+            8883,
+        )
+        .set_ca(read(&rootCApath).expect("cannot open rootCA"))
+        .set_client_auth(read(&certpath).unwrap(), read(&privatekeypath).unwrap())
+        .set_keep_alive(10)
+        .set_connection_timeout(5)
+        .set_reconnect_opts(ReconnectOptions::Always(5));
+
+        let (mut mqttclient, notifications) =
+            MqttClient::start(mqttoptions).expect("connexct error");
+
+        let r = match mqttclient.subscribe("topic_1", QoS::AtMostOnce) {
+            Ok(f) => println!("subscribe"),
+            Err(e) => println!("client error = {:?}", e),
+        };
+        let sleep_time = Duration::from_secs(10);
+
+        thread::spawn(move || {
+            loop {
+                let d = vec![
+                    0x52, 0x42, 0x36, 0x0, 0x1, 0x21, 0x50, 0x6a, 0x1, 0xb, 0x97, 0x15, 0x72, 0x0,
+                    0x84, 0x24, 0xf, 0x0, 0xb6, 0x20, 0x17, 0x0, 0x29, 0x2, 0xee, 0x1d, 0xac, 0x9,
+                    0x1, 0x14, 0x0, 0x34, 0x3, 0xcc, 0xb, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+                    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5c, 0xab,
+                    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+                    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+                ];
+                let mut sam = usb_2jcie::usb_2jcie::new();
+                sam.parse(&d);
+                //json文字列を作る
+                let json = serde_json::to_string(&sam).unwrap();
+                thread::sleep(sleep_time);
+                match mqttclient.publish("topic_1", QoS::AtLeastOnce, false, json.as_str()) {
+                    Ok(f) => println!("published!"),
+                    Err(e) => println!("client error = {:?}", e),
+                };
+            }
+        });
+        for notification in notifications {
+            println!("{:?}", notification)
+        }
     }
-    Ok((xMag as i16, yMag as i16, zMag as i16))
-}
-fn acquire() -> Result<u8, rppal::i2c::Error> {
-    let mut i2c = I2c::new()?;
-    i2c.set_slave_address(ADDR_I2C)?;
-    i2c.smbus_write_byte(REG_CTRL_HUM, 1u8)?;
-    let data: u8 = i2c.smbus_read_byte(REG_ADC_VALUE)?;
-    Ok(data)
+
+    #[test]
+    fn http() {
+        use reqwest;
+        use usb_2jcie;
+        let d = vec![
+            0x52, 0x42, 0x36, 0x0, 0x1, 0x21, 0x50, 0x6a, 0x1, 0xb, 0x97, 0x15, 0x72, 0x0, 0x84,
+            0x24, 0xf, 0x0, 0xb6, 0x20, 0x17, 0x0, 0x29, 0x2, 0xee, 0x1d, 0xac, 0x9, 0x1, 0x14,
+            0x0, 0x34, 0x3, 0xcc, 0xb, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x5c, 0xab, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0,
+        ];
+
+        let mut sam = usb_2jcie::usb_2jcie::new();
+        sam.parse(&d);
+        //json文字列を作る
+        let json = serde_json::to_string(&sam).unwrap();
+        dbg!(&json);
+        //let body = reqwest::blocking::get("http://192.168.1.4:1880/getting").unwrap().text();
+        let client = reqwest::blocking::Client::new();
+        let body2 = client
+            .post("http://192.168.1.4:1880/post")
+            .body(json)
+            .send()
+            .unwrap();
+        dbg!(body2);
+    }
+    #[test]
+    fn getdata() {
+        /*let ports = serialport::available_ports().expect("No ports found");
+        for p in ports {
+            dbg!(&p);
+        }*/
+
+        let mut command = vec![
+            0x52u8, 0x42, 0x0a, 0x00, 0x02, 0x11, 0x51, 0x01, 0x00, 255, 255, 0,
+        ]; // LED ON
+        let (crc_l, crc_h) = crc16(&command, 0, command.len());
+        command.push(crc_l);
+        command.push(crc_h);
+
+        let mut command2 = vec![0x52u8, 0x42, 0x05, 0x00, 0x01, 0x21, 0x50]; //get latest data long
+        let (crc_l, crc_h) = crc16(&command2, 0, command2.len());
+        command2.push(crc_l);
+        command2.push(crc_h);
+        let mut serial = serialport::new("/dev/ttyUSB0", 115200)
+            .timeout(Duration::from_millis(100))
+            .open()
+            .expect("failed to open port");
+
+        serial.write_all(&command).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let result2 = serial.write_all(&command2).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let mut res: Vec<u8> = vec![0; 70];
+        serial.read(res.as_mut()).unwrap();
+
+        show(&res);
+    }
 }

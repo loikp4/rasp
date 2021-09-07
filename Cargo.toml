@@ -1,7 +1,7 @@
 [package]
 name = "rasp"
 version = "0.1.0"
-authors = ["oguma <mineaki123@gmail.com>"]
+authors = ["anyone"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,3 +10,12 @@ edition = "2018"
 rppal = "*"
 futures = "*"
 tokio = {version="*",features=["full"]}
+log = "*"
+simplelog="*"
+serialport = "4.0.0"
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = "^1.0"
+rumqtt = "*"
+chrono = "0.4.13"
+rand = "*"
+reqwest={version = "*",features=["blocking", "json"] }
