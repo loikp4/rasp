@@ -1,8 +1,5 @@
-extern crate rppal;
 extern crate serialport;
 
-mod httprequest;
-mod mqtt;
 mod usb_2jcie;
 
 use core::time::Duration;
@@ -24,27 +21,31 @@ async fn main() {
         dbg!(&p);
     }*/
     let mut data = usb_2jcie::usb_2jcie::new();
-    let rootCApath = Path::new("../cert/root-CA.crt");
-    let privatekeypath = Path::new("/home/master/rasp/cert/raspidevice.private.key");
-    let certpath = Path::new("/home/master/rasp/cert/raspidevice.cert.pem");
+    let rootCApath = Path::new(r"./cert/root-CA.crt");
+    let privatekeypath = Path::new(r"./cert/raspidevice.private.key");
+    let certpath = Path::new(r"./cert/raspidevice.cert.pem");
     let mqttoptions: MqttOptions = MqttOptions::new(
-        "sdk-nodejs-7c641eb5-0c2e-4e2e-9bb5-c8920275ae7c",
+        "sdk-nodejs-7c6-rasp4",
         "a3tzmb0oyi31tk-ats.iot.ap-northeast-1.amazonaws.com",
         8883,
     )
     .set_ca(read(&rootCApath).expect("cannot open rootCA"))
-    .set_client_auth(read(&certpath).unwrap(), read(&privatekeypath).unwrap())
+    .set_client_auth(
+        read(&certpath).expect("cannot open cert.pem"),
+        read(&privatekeypath).expect("cannot open privatekey"),
+    )
     .set_keep_alive(10)
     .set_connection_timeout(5)
     .set_reconnect_opts(ReconnectOptions::Always(5));
-    let (mut mqttclient, notifications) = MqttClient::start(mqttoptions).expect("connexct error");
+    let (mut mqttclient, notifications) = 
+    MqttClient::start(mqttoptions).expect("connect error");
 
     let _r = match mqttclient.subscribe("topic_1", QoS::AtMostOnce) {
         Ok(_f) => println!("subscribe"),
         Err(e) => println!("client error = {:?}", e),
     };
 
-    let mut serial = serialport::new("/dev/ttyUSB0", 115200)
+    let mut serial = serialport::new("COM3", 115200)
         .timeout(Duration::from_millis(100))
         .open()
         .expect("failed to open port");
@@ -60,20 +61,22 @@ async fn main() {
                     let json = serde_json::to_string(&data).unwrap();
                     thread::sleep(Duration::from_millis(100));
                     match mqttclient.publish("topic_1", QoS::AtLeastOnce, false, json.as_str()) {
-                        Ok(_f) => println!("published!"),
+                        Ok(_f) => println!("data = {:?}", json),
                         Err(e) => println!("client error = {:?}", e),
-                    };
+                    }
                 }
                 Err(_) => todo!(),
             }
-            thread::sleep(Duration::from_secs(10));
+            thread::sleep(Duration::from_secs(12));
         }
     });
 
     for notification in notifications {
-        println!("{:?}", notification)
+        //println!("{:?}", notification)
     }
 }
+
+
 
 fn show(byte: &Vec<u8>) {
     for i in byte {
@@ -113,24 +116,21 @@ fn getlongdata(ser: &mut Box<dyn SerialPort>) -> Result<Vec<u8>, serialport::Err
     command2.push(crc_l);
     command2.push(crc_h);
 
-    ser.write_all(&command).unwrap();
-    thread::sleep(Duration::from_millis(100));
     ser.write_all(&command2)?; //send for getting latest data long
     thread::sleep(Duration::from_millis(100));
     let mut res: Vec<u8> = vec![0; 90];
-    ser.read(res.as_mut())?;
+    ser.read_exact(res.as_mut())?;
 
     show(&res);
     Ok(res)
 }
 
 //usbからLongdataが取得できているかどうかを探る イテレータの関数でなんとかできないか
-fn getindex(longdata: &Vec<u8>) -> Option<usize> {
+fn getindex(longdata: &[u8]) -> Option<usize> {
     let checking = [0x52u8, 0x42, 0x36, 0x0, 0x1, 0x21, 0x50];
     for (i, num) in longdata.iter().enumerate() {
         for j in checking.iter().enumerate() {
             if longdata[i + j.0] == checking[j.0] {
-                println!("{:x}", j.1);
             } else {
                 break;
             }
@@ -248,7 +248,7 @@ mod tests {
         use std::error::Error;
         use std::fs::{read, File};
         use std::path::Path;
-        let rootCApath = Path::new("../cert/root-CA.crt");
+        let rootCApath = Path::new(r"..\cert\root-CA.crt");
         let privatekeypath = Path::new("../cert/raspidevice.private.key");
         let certpath = Path::new("/home/master/rasp/cert/raspidevice.cert.pem");
         let mqttoptions = MqttOptions::new(
@@ -349,7 +349,7 @@ mod tests {
 
         serial.write_all(&command).unwrap();
         thread::sleep(Duration::from_millis(100));
-        let result2 = serial.write_all(&command2).unwrap();
+        serial.write_all(&command2).unwrap();
         thread::sleep(Duration::from_millis(100));
         let mut res: Vec<u8> = vec![0; 70];
         serial.read(res.as_mut()).unwrap();
