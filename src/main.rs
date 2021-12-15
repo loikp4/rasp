@@ -22,11 +22,11 @@ async fn main() {
     }*/
     let mut data = usb_2jcie::usb_2jcie::new();
     let rootCApath = Path::new(r"./cert/root-CA.crt");
-    let privatekeypath = Path::new(r"./cert/raspidevice.private.key");
-    let certpath = Path::new(r"./cert/raspidevice.cert.pem");
+    let privatekeypath = Path::new(r"./cert/private.key");
+    let certpath = Path::new(r"./cert/cert.pem");
     let mqttoptions: MqttOptions = MqttOptions::new(
-        "sdk-nodejs-7c6-rasp4",
-        "a3tzmb0oyi31tk-ats.iot.ap-northeast-1.amazonaws.com",
+        "ID",
+        "host",
         8883,
     )
     .set_ca(read(&rootCApath).expect("cannot open rootCA"))
